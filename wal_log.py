@@ -1,88 +1,84 @@
 #!/usr/bin/env python3
-"""Write-Ahead Log (WAL) for crash recovery. Zero dependencies."""
-import json, os, sys, time, struct
+"""Write-Ahead Log for crash recovery."""
+import json, os, tempfile, time
 
 class WAL:
-    def __init__(self, path="wal.log"):
+    def __init__(self, path: str):
         self.path = path
-        self.entries = []
-        if os.path.exists(path):
-            self._recover()
+        self._f = open(path, "a")
+        self._seq = 0
 
-    def append(self, operation, key, value=None):
-        entry = {"seq": len(self.entries), "ts": time.time(),
-                 "op": operation, "key": key, "value": value}
-        self.entries.append(entry)
-        with open(self.path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-        return entry["seq"]
+    def append(self, op: str, key: str, value=None) -> int:
+        self._seq += 1
+        entry = {"seq": self._seq, "op": op, "key": key, "ts": time.time()}
+        if value is not None:
+            entry["value"] = value
+        self._f.write(json.dumps(entry) + "\n")
+        self._f.flush()
+        os.fsync(self._f.fileno())
+        return self._seq
 
-    def _recover(self):
-        with open(self.path) as f:
+    def replay(self) -> list:
+        entries = []
+        with open(self.path, "r") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    try:
-                        self.entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        break  # corrupted entry, stop
+                    entries.append(json.loads(line))
+        return entries
 
-    def replay(self, store=None):
-        if store is None: store = {}
-        for entry in self.entries:
-            if entry["op"] == "set":
-                store[entry["key"]] = entry["value"]
-            elif entry["op"] == "delete":
-                store.pop(entry["key"], None)
-        return store
-
-    def checkpoint(self, state):
-        cp_path = self.path + ".checkpoint"
-        with open(cp_path, "w") as f:
-            json.dump({"state": state, "seq": len(self.entries)}, f)
-        # Truncate WAL
+    def truncate(self, after_seq: int = 0):
+        entries = [e for e in self.replay() if e["seq"] > after_seq]
+        self._f.close()
         with open(self.path, "w") as f:
-            pass
-        self.entries.clear()
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        self._f = open(self.path, "a")
 
-    def __len__(self):
-        return len(self.entries)
+    def close(self):
+        self._f.close()
 
-class WALStore:
-    def __init__(self, path="wal_store"):
-        os.makedirs(path, exist_ok=True)
-        self.wal = WAL(os.path.join(path, "wal.log"))
-        self.cp_path = os.path.join(path, "wal.log.checkpoint")
-        self.data = {}
-        if os.path.exists(self.cp_path):
-            with open(self.cp_path) as f:
-                self.data = json.load(f).get("state", {})
-        self.data = self.wal.replay(self.data)
+    @staticmethod
+    def recover(path: str) -> dict:
+        state = {}
+        if not os.path.exists(path):
+            return state
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                entry = json.loads(line)
+                if entry["op"] == "put":
+                    state[entry["key"]] = entry.get("value")
+                elif entry["op"] == "delete":
+                    state.pop(entry["key"], None)
+        return state
 
-    def get(self, key, default=None):
-        return self.data.get(key, default)
-
-    def set(self, key, value):
-        self.wal.append("set", key, value)
-        self.data[key] = value
-
-    def delete(self, key):
-        self.wal.append("delete", key)
-        self.data.pop(key, None)
-
-    def checkpoint(self):
-        self.wal.checkpoint(self.data)
+def test():
+    with tempfile.NamedTemporaryFile(suffix=".wal", delete=False) as tmp:
+        path = tmp.name
+    try:
+        wal = WAL(path)
+        wal.append("put", "a", 1)
+        wal.append("put", "b", 2)
+        wal.append("delete", "a")
+        wal.append("put", "c", 3)
+        wal.close()
+        state = WAL.recover(path)
+        assert state == {"b": 2, "c": 3}
+        # Replay
+        wal2 = WAL(path)
+        entries = wal2.replay()
+        assert len(entries) == 4
+        assert entries[0]["op"] == "put"
+        # Truncate
+        wal2.truncate(after_seq=2)
+        entries2 = wal2.replay()
+        assert len(entries2) == 2
+        wal2.close()
+    finally:
+        os.unlink(path)
+    print("  wal_log: ALL TESTS PASSED")
 
 if __name__ == "__main__":
-    import tempfile
-    path = tempfile.mkdtemp()
-    store = WALStore(path)
-    store.set("name", "Alice")
-    store.set("age", "30")
-    print(f"name: {store.get('name')}")
-    store.checkpoint()
-    store.set("city", "NYC")
-    # Simulate recovery
-    store2 = WALStore(path)
-    print(f"Recovered name: {store2.get('name')}")
-    print(f"Recovered city: {store2.get('city')}")
+    test()
