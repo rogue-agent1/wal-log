@@ -1,73 +1,89 @@
 #!/usr/bin/env python3
-"""wal_log - Write-ahead log for crash recovery."""
-import sys, json, os, tempfile
+"""Write-Ahead Log (WAL) implementation."""
+import struct, hashlib, time, os, tempfile
+
+MAGIC = b"WAL1"
+
+def _checksum(data: bytes) -> bytes:
+    return hashlib.md5(data).digest()[:4]
 
 class WAL:
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = path
-        self.lsn = 0
-    def append(self, op, data):
-        self.lsn += 1
-        entry = {"lsn": self.lsn, "op": op, "data": data}
-        with open(self.path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-        return self.lsn
-    def read(self, from_lsn=0):
-        entries = []
-        if not os.path.exists(self.path):
-            return entries
-        with open(self.path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    entry = json.loads(line)
-                    if entry["lsn"] > from_lsn:
-                        entries.append(entry)
-        return entries
-    def replay(self, state=None):
-        if state is None:
-            state = {}
-        for entry in self.read():
-            op = entry["op"]
-            data = entry["data"]
-            if op == "set":
-                state[data["key"]] = data["value"]
-            elif op == "delete":
-                state.pop(data["key"], None)
-        return state
-    def truncate(self, up_to_lsn):
-        entries = [e for e in self.read() if e["lsn"] > up_to_lsn]
-        with open(self.path, "w") as f:
-            for e in entries:
-                f.write(json.dumps(e) + "\n")
-    def checkpoint(self, state, checkpoint_path):
-        with open(checkpoint_path, "w") as f:
-            json.dump({"lsn": self.lsn, "state": state}, f)
+        self._fd = open(path, "ab+")
+        self._seq = 0
 
-def test():
-    with tempfile.TemporaryDirectory() as td:
-        wal = WAL(os.path.join(td, "wal.log"))
-        wal.append("set", {"key": "a", "value": 1})
-        wal.append("set", {"key": "b", "value": 2})
-        wal.append("delete", {"key": "a"})
-        wal.append("set", {"key": "c", "value": 3})
-        state = wal.replay()
-        assert state == {"b": 2, "c": 3}
-        entries = wal.read()
-        assert len(entries) == 4
-        entries_from_2 = wal.read(from_lsn=2)
-        assert len(entries_from_2) == 2
-        wal.truncate(2)
-        assert len(wal.read()) == 2
-        cp = os.path.join(td, "checkpoint.json")
-        wal.checkpoint(state, cp)
-        with open(cp) as f:
-            data = json.load(f)
-        assert data["state"] == {"b": 2, "c": 3}
-        print("OK: wal_log")
+    def append(self, operation: str, key: str, value: str = "") -> int:
+        self._seq += 1
+        payload = f"{operation}\x00{key}\x00{value}".encode()
+        record = struct.pack(">I", self._seq) + struct.pack(">I", len(payload)) + payload
+        record += _checksum(record)
+        self._fd.write(MAGIC + record)
+        self._fd.flush()
+        return self._seq
+
+    def replay(self) -> list:
+        records = []
+        self._fd.seek(0)
+        data = self._fd.read()
+        pos = 0
+        while pos < len(data):
+            if data[pos:pos+4] != MAGIC:
+                break
+            pos += 4
+            seq = struct.unpack(">I", data[pos:pos+4])[0]; pos += 4
+            plen = struct.unpack(">I", data[pos:pos+4])[0]; pos += 4
+            payload = data[pos:pos+plen]; pos += plen
+            cksum = data[pos:pos+4]; pos += 4
+            # Verify
+            record = struct.pack(">I", seq) + struct.pack(">I", plen) + payload
+            if _checksum(record) != cksum:
+                break  # Corrupted
+            parts = payload.decode().split("\x00", 2)
+            records.append({"seq": seq, "op": parts[0], "key": parts[1], "value": parts[2] if len(parts) > 2 else ""})
+        return records
+
+    def truncate(self):
+        self._fd.close()
+        self._fd = open(self.path, "wb+")
+        self._seq = 0
+
+    def close(self):
+        self._fd.close()
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        test()
-    else:
-        print("Usage: wal_log.py test")
+    import sys
+    with tempfile.NamedTemporaryFile(suffix=".wal", delete=False) as f:
+        path = f.name
+    wal = WAL(path)
+    wal.append("SET", "name", "Alice")
+    wal.append("SET", "age", "30")
+    wal.append("DEL", "temp")
+    print(f"Replayed: {wal.replay()}")
+    wal.close()
+    os.unlink(path)
+
+def test():
+    import tempfile
+    path = tempfile.mktemp(suffix=".wal")
+    try:
+        w = WAL(path)
+        w.append("SET", "k1", "v1")
+        w.append("SET", "k2", "v2")
+        w.append("DEL", "k1")
+        records = w.replay()
+        assert len(records) == 3
+        assert records[0]["op"] == "SET"
+        assert records[0]["key"] == "k1"
+        assert records[2]["op"] == "DEL"
+        w.close()
+        # Reopen and replay (persistence)
+        w2 = WAL(path)
+        records2 = w2.replay()
+        assert len(records2) == 3
+        w2.truncate()
+        assert w2.replay() == []
+        w2.close()
+    finally:
+        if os.path.exists(path): os.unlink(path)
+    print("  wal_log: ALL TESTS PASSED")
