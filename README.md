@@ -1,10 +1,11 @@
-# Wal Log
+# wal-log
 
-A zero-dependency Python CLI tool.
+Write-ahead log for crash recovery.
 
 ## Usage
 
 ```bash
-python wal_log.py test
-python wal_log.py demo
+python3 wal_log.py test
 ```
+
+Zero dependencies. Python 3.8+.
